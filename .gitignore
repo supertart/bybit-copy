@@ -1,0 +1,53 @@
+# === Python build files ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+
+# === Virtual environments ===
+venv/
+.venv/
+env/
+ENV/
+
+# === IDE & Editor configs ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === Logs and temp files ===
+*.log
+logs/
+tmp/
+*.tmp
+
+# === Environment & secrets ===
+.env
+.env.*
+!*.env.example
+
+# === State and data ===
+state.json
+data/
+*.db
+*.sqlite3
+
+# === Jupyter & notebooks ===
+.ipynb_checkpoints/
+*.ipynb
+
+# === OS-specific ===
+.DS_Store
+Thumbs.db
+
+# === Other ===
+# compiled gettext catalogs
+*.mo
+*.pot
+# backup files
+*~

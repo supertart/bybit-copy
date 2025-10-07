@@ -1,0 +1,27 @@
+{
+  "stats": {
+    "history": [],
+    "open_count": 0
+  },
+  "settings": {
+    "COPY_ACTIVE": true,
+    "COPY_TP": true,
+    "COPY_SL": true,
+    "DRY_RUN": false,
+    "POSITION_IDX": 0,
+    "SIZE_SCALE": 1.0,
+    "DYNAMIC_SCALE": true,
+    "DYN_SCALE_FACTOR": 0.9,
+    "VOLATILITY_SCALE": true,
+    "MAX_EQUITY_RISK_PCT": 2.0,
+    "MIN_LIQ_BUFFER_PCT": 20.0,
+    "MAX_DCA_PER_TRADE": 2,
+    "LOCAL_SL_PCT": 25.0,
+    "LIQ_BUFFER_EMERGENCY": 10.0,
+    "CUT_PERCENT": 30.0,
+    "EQUITY_DRAWDOWN_PCT": 15.0,
+    "AUTO_CLOSE_ON_DRAWDOWN": false,
+    "RISK_ALERTS": true,
+    "NOTIFY_LANG": "ru"
+  }
+}

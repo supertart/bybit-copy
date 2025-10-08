@@ -1,146 +1,290 @@
-import requests
-import logging
-import time
-import hmac
+"""
+Bybit Unified v5 (demo/testnet/mainnet) — асинхронная обёртка на aiohttp
+------------------------------------------------------------------------
+Базовые домены:
+- demo:    https://api-demo.bybit.com
+- testnet: https://api-testnet.bybit.com
+- mainnet: https://api.bybit.com
+
+Единый торговый аккаунт (UNIFIED), линейные перпетуалы (USDT).
+Методы:
+    - check_auth()
+    - get_balance()
+    - get_open_positions()
+    - set_leverage(symbol, leverage)
+    - open_position(symbol, side, qty, leverage)
+    - close_position(symbol)
+    - close()
+
+Подпись v5: HMAC_SHA256(secret, ts + apiKey + recvWindow + queryString + body)
+timestamp берём с /v5/market/time (timeNano -> ms).
+
+ВАЖНО: для POST кладём category="linear" в BODY (не в query),
+чтобы строка подписи совпадала с тем, что ожидает Bybit (как в твоём логе origin_string).
+"""
+
+import aiohttp
 import hashlib
+import hmac
 import json
-from urllib.parse import urlencode
+import logging
+import math
+from typing import Any, Dict, Optional, List
 
-# ====================== BYBIT API WRAPPER ===========================
-class BybitHTTP:
-    """
-    Упрощённый HTTP-клиент для работы с API Bybit.
-    Работает как с мастером, так и с подписчиком.
-    """
+logger = logging.getLogger(__name__)
 
-    def __init__(self, api_key, api_secret, testnet=False):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.base_url = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
 
-    # ---------- Вспомогательные ----------
-    def _sign(self, params):
-        param_str = urlencode(sorted(params.items()))
-        return hmac.new(
-            bytes(self.api_secret, "utf-8"),
-            bytes(param_str, "utf-8"),
-            hashlib.sha256
-        ).hexdigest()
+def _base_url(env: str) -> str:
+    env = (env or "mainnet").lower()
+    if env == "demo":
+        return "https://api-demo.bybit.com"
+    if env == "testnet":
+        return "https://api-testnet.bybit.com"
+    return "https://api.bybit.com"
 
-    def _request(self, method, path, params=None, body=None, auth=True):
-        url = f"{self.base_url}{path}"
-        headers = {}
-        if auth:
-            timestamp = str(int(time.time() * 1000))
-            params = params or {}
-            params.update({"api_key": self.api_key, "timestamp": timestamp})
-            sign = self._sign(params)
-            params["sign"] = sign
+
+class BybitAPI:
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        is_testnet: bool = False,   # обратная совместимость
+        role: str = "UNKNOWN",
+        env: Optional[str] = None   # demo | testnet | mainnet
+    ):
+        self.role = (role or "UNKNOWN").upper()
+        self.api_key = api_key or ""
+        self.api_secret = api_secret or ""
+        self.env = (env or ("testnet" if is_testnet else "mainnet")).lower()
+        self.base = _base_url(self.env)
+
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._recv_window = "20000"  # окно на всякий случай
+
+        logger.info(f"🔗 [{self.role}] Bybit v5 Unified init: env={self.env} base={self.base}")
+
+    # ---------------------- низкоуровневые ----------------------
+
+    async def _ensure_session(self):
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=30)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+
+    async def _get_server_ts_ms(self) -> str:
+        await self._ensure_session()
+        url = f"{self.base}/v5/market/time"
+        async with self._session.get(url) as r:
+            j = await r.json()
+        # timeNano -> миллисекунды
+        ts_ms = int(math.floor(int(j["result"]["timeNano"]) / 1e6))
+        return str(ts_ms)
+
+    def _sign(self, ts: str, query: str, body: str = "") -> str:
+        pre_sign = ts + self.api_key + self._recv_window + (query or "") + (body or "")
+        return hmac.new(self.api_secret.encode(), pre_sign.encode(), hashlib.sha256).hexdigest()
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        params: Dict[str, Any] | None = None,
+        body: Dict[str, Any] | None = None
+    ):
+        await self._ensure_session()
+        params = params or {}
+        body = body or {}
+
+        # query string (сортируем для детерминированности подписи)
+        if params:
+            qs_pairs = [f"{k}={v}" for k, v in sorted(params.items())]
+            query = "&".join(qs_pairs)
+        else:
+            query = ""
+
+        # тело подписываем как JSON без пробелов
+        body_str = json.dumps(body, separators=(",", ":")) if body else ""
+
+        ts = await self._get_server_ts_ms()
+        sign = self._sign(ts, query, body_str)
+
+        headers = {
+            "X-BAPI-API-KEY": self.api_key,
+            "X-BAPI-SIGN": sign,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": self._recv_window,
+            "Content-Type": "application/json",
+        }
+
+        url = f"{self.base}{path}"
+        if query:
+            url = f"{url}?{query}"
+
         try:
-            if method == "GET":
-                r = self.session.get(url, params=params, timeout=10)
-            else:
-                r = self.session.post(url, json=body or params, timeout=10)
-            data = r.json()
-            if data.get("retCode", 0) != 0:
-                logging.warning(f"Bybit API error {path}: {data}")
-            return data.get("result", {})
+            async with self._session.request(method.upper(), url, headers=headers, data=body_str if body else None) as r:
+                text = await r.text()
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    logger.warning(f"[{self.role}] Non-JSON response {r.status}: {text[:200]}")
+                    r.raise_for_status()
+                    return None
+                if r.status != 200 or str(data.get("retCode")) != "0":
+                    logger.warning(f"[{self.role}] Bybit v5 error: HTTP={r.status} resp={text[:400]}")
+                return data
         except Exception as e:
-            logging.warning(f"Bybit request failed: {e}")
-            return {}
+            logger.warning(f"[{self.role}] HTTP error: {e}")
+            return None
 
-    # ---------- Основные методы ----------
-    def get_positions(self):
-        """Возвращает список открытых позиций"""
-        res = self._request("GET", "/v5/position/list", {"category": "linear"})
-        return res.get("list", []) if isinstance(res, dict) else []
+    # ---------------------- публичные методы ----------------------
 
-    def get_position(self, symbol):
-        for pos in self.get_positions():
-            if pos["symbol"] == symbol:
-                return pos
+    async def check_auth(self) -> bool:
+        data = await self._request(
+            "GET",
+            "/v5/account/wallet-balance",
+            params={"accountType": "UNIFIED"},
+        )
+        ok = bool(data and str(data.get("retCode")) == "0")
+        if ok:
+            try:
+                total = data["result"]["list"][0]["totalEquity"]
+                logger.info(f"[{self.role}] ✅ Auth OK — totalEquity={total}")
+            except Exception:
+                logger.info(f"[{self.role}] ✅ Auth OK")
+        else:
+            logger.warning(f"[{self.role}] ❌ Auth failed")
+        return ok
+
+    async def get_balance(self) -> float:
+        data = await self._request(
+            "GET",
+            "/v5/account/wallet-balance",
+            params={"accountType": "UNIFIED"},
+        )
+        if not data or str(data.get("retCode")) != "0":
+            return 0.0
+        try:
+            coins = data["result"]["list"][0]["coin"]
+            for c in coins:
+                if c.get("coin") == "USDT":
+                    return float(c.get("availableToWithdraw") or c.get("walletBalance") or 0.0)
+        except Exception:
+            pass
+        return 0.0
+
+    async def get_open_positions(self) -> List[Dict[str, Any]]:
+        """
+        Unified позиции по линейным перпетуалам USDT.
+        Требует либо symbol, либо settleCoin — добавляем settleCoin=USDT.
+        Возвращаем: symbol, side ('buy'/'sell'), contracts, entryPrice, leverage
+        """
+        data = await self._request(
+            "GET",
+            "/v5/position/list",
+            params={"category": "linear", "accountType": "UNIFIED", "settleCoin": "USDT"},
+        )
+        result: List[Dict[str, Any]] = []
+        if not data or str(data.get("retCode")) != "0":
+            return result
+
+        for item in (data.get("result", {}).get("list") or []):
+            try:
+                size = float(item.get("size") or 0.0)
+            except Exception:
+                size = 0.0
+            if size <= 0:
+                continue
+            side = (item.get("side") or "").lower()  # "buy" / "sell"
+            symbol = (item.get("symbol") or "").upper()  # "BTCUSDT"
+            entry = float(item.get("avgPrice") or 0.0)
+            lev = int(float(item.get("leverage") or 10))
+            result.append({
+                "symbol": symbol,
+                "side": side,
+                "contracts": size,
+                "entryPrice": entry,
+                "leverage": lev,
+            })
+        return result
+
+    async def set_leverage(self, symbol: str, leverage: int) -> bool:
+        """
+        POST: category переносим в BODY, чтобы строка подписи совпадала.
+        """
+        data = await self._request(
+            "POST",
+            "/v5/position/set-leverage",
+            params={},  # пусто!
+            body={"category": "linear", "symbol": symbol.upper(), "buyLeverage": str(leverage), "sellLeverage": str(leverage)},
+        )
+        return bool(data and str(data.get("retCode")) == "0")
+
+    async def open_position(self, symbol: str, side: str, qty: float, leverage: int = 10):
+        """
+        Рыночный вход. symbol: 'BTCUSDT', side: 'buy'|'sell', qty: число контрактов (size).
+        POST: category в BODY.
+        """
+        side_v5 = "Buy" if side.lower() in ("buy", "long") else "Sell"
+        await self.set_leverage(symbol, leverage)
+        data = await self._request(
+            "POST",
+            "/v5/order/create",
+            params={},  # пусто!
+            body={
+                "category": "linear",
+                "symbol": symbol.upper(),
+                "side": side_v5,
+                "orderType": "Market",
+                "qty": str(qty),
+                "timeInForce": "IOC",
+            },
+        )
+        if data and str(data.get("retCode")) == "0":
+            logger.info(f"[{self.role}] ✅ Opened {symbol} {side_v5} qty={qty}")
+            return data
+        logger.warning(f"[{self.role}] Failed to open {symbol} {side_v5} qty={qty}")
         return None
 
-    def get_mark_price(self, symbol):
-        res = self._request("GET", "/v5/market/tickers", {"category": "linear", "symbol": symbol})
-        try:
-            return float(res["list"][0]["markPrice"])
-        except Exception:
-            return 0.0
-
-    def get_volatility(self, symbol):
-        """Приближение: волатильность = abs(price24hPcnt)*100"""
-        res = self._request("GET", "/v5/market/tickers", {"category": "linear", "symbol": symbol})
-        try:
-            return abs(float(res["list"][0]["price24hPcnt"])) * 100
-        except Exception:
-            return 0.0
-
-    def market_order(self, symbol, side, qty, reduce_only=False):
-        """Отправка маркет-ордера"""
-        body = {
-            "category": "linear",
-            "symbol": symbol,
-            "side": side,
-            "orderType": "Market",
-            "qty": str(qty),
-            "reduceOnly": reduce_only
-        }
-        res = self._request("POST", "/v5/order/create", body)
-        logging.info(f"🟢 Ордер {side} {qty} {symbol} → {res}")
-        return res
-
-    def close_position(self, symbol):
-        """Закрытие всей позиции"""
-        pos = self.get_position(symbol)
-        if not pos or float(pos.get("size") or 0) == 0:
-            return
-        side = "Sell" if pos["side"] == "Buy" else "Buy"
-        qty = float(pos["size"])
-        self.market_order(symbol, side, qty, reduce_only=True)
-
-    def set_take_profit(self, symbol, price):
-        pos = self.get_position(symbol)
+    async def close_position(self, symbol: str) -> bool:
+        """
+        Закрываем позицию встречным рыночным ордером.
+        POST: category в BODY.
+        """
+        positions = await self.get_open_positions()
+        pos = next((p for p in positions if p["symbol"] == symbol.upper()), None)
         if not pos:
-            return
-        body = {
-            "category": "linear",
-            "symbol": symbol,
-            "takeProfit": str(price)
-        }
-        self._request("POST", "/v5/position/trading-stop", body)
-        logging.info(f"✅ TP {symbol} = {price}")
+            logger.info(f"[{self.role}] Нет открытой позиции по {symbol} — закрывать нечего.")
+            return True
 
-    def set_stop_loss(self, symbol, price):
-        pos = self.get_position(symbol)
-        if not pos:
-            return
-        body = {
-            "category": "linear",
-            "symbol": symbol,
-            "stopLoss": str(price)
-        }
-        self._request("POST", "/v5/position/trading-stop", body)
-        logging.info(f"✅ SL {symbol} = {price}")
+        qty = float(pos["contracts"])
+        if qty <= 0:
+            logger.info(f"[{self.role}] Позиция по {symbol} уже нулевая.")
+            return True
 
-    def get_follower_equity(self):
-        """Баланс подписчика"""
-        res = self._request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+        opposite = "Sell" if pos["side"].lower() == "buy" else "Buy"
+        data = await self._request(
+            "POST",
+            "/v5/order/create",
+            params={},  # пусто!
+            body={
+                "category": "linear",
+                "symbol": symbol.upper(),
+                "side": opposite,
+                "orderType": "Market",
+                "qty": str(qty),
+                "timeInForce": "IOC",
+                "reduceOnly": True,
+            },
+        )
+        ok = bool(data and str(data.get("retCode")) == "0")
+        if ok:
+            logger.info(f"[{self.role}] 💤 Closed {symbol} with {opposite} qty={qty}")
+        else:
+            logger.warning(f"[{self.role}] Не удалось закрыть {symbol} ({opposite} {qty})")
+        return ok
+
+    async def close(self):
         try:
-            return float(res["list"][0]["coin"][0]["walletBalance"])
+            if self._session and not self._session.closed:
+                await self._session.close()
         except Exception:
-            return 0.0
-
-    def get_master_equity(self):
-        """Баланс мастера (тот же метод, но для отдельного API-ключа)"""
-        return self.get_follower_equity()
-
-    # ---------- Telegram уведомления ----------
-    def send_telegram_message(self, text):
-        try:
-            token = self.api_key  # заглушка — реальный токен хранится в cfg, не здесь
-            logging.info(f"Telegram: {text}")
-        except Exception as e:
-            logging.warning(f"Ошибка Telegram уведомления: {e}")
+            pass

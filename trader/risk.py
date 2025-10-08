@@ -1,130 +1,143 @@
+"""
+Модуль управления рисками (Risk Manager)
+---------------------------------------
+Анализирует параметры позиции, проверяет доступный баланс,
+расчёт максимально допустимого лота и оценку риска ликвидации.
+"""
+
 import logging
-import time
-from utils.api_wrappers import BybitHTTP
-from config import save_config
+from decimal import Decimal
+
+logger = logging.getLogger(__name__)
 
 
 class RiskManager:
     """
-    Управление рисками: динамическое масштабирование, стоп-лоссы, ликвидационный буфер, авто-пауза.
+    Менеджер рисков подписчика.
+    Проверяет, можно ли открыть сделку и с каким объёмом.
     """
 
-    def __init__(self, cfg, follower_api: BybitHTTP):
+    def __init__(self, cfg: dict, api=None):
+        """
+        cfg — конфигурация (.env)
+        api — объект подключения к Bybit API (может быть None)
+        """
         self.cfg = cfg
-        self.api = follower_api
-        self.last_equity = 0
-        self.max_equity = 0
-        self.last_check = 0
+        self.api = api
+        self.max_leverage = 50           # макс. разрешённое плечо
+        self.max_risk_per_trade = 0.05   # доля риска на сделку (5%)
+        self.min_balance_threshold = 10  # минимум для работы (USDT)
+        self.test_mode = self.cfg.get("FOLLOWER_NET", "mainnet") == "testnet"
 
-    # ====================== РАСЧЁТ РАЗМЕРА ===========================
-    def calculate_scaled_qty(self, master_size, master_price, symbol):
+        logger.info(
+            f"🔒 Инициализация RiskManager (test_mode={self.test_mode}, "
+            f"max_risk={self.max_risk_per_trade * 100:.1f}%)"
+        )
+
+    # ================================================================
+    # 🔹 Проверка достаточности баланса
+    # ================================================================
+
+    def check_balance(self, balance: float) -> bool:
+        """Проверяет, достаточно ли средств для открытия сделки"""
+        if balance < self.min_balance_threshold:
+            logger.warning(
+                f"⚠️ Недостаточный баланс ({balance:.2f} USDT) "
+                f"— минимум {self.min_balance_threshold:.2f} USDT."
+            )
+            return False
+        return True
+
+    # ================================================================
+    # 🔹 Расчёт максимально допустимого размера позиции
+    # ================================================================
+
+    def calculate_position_size(self, balance: float, price: float, leverage: float = 10) -> float:
         """
-        Возвращает масштабированное количество для подписчика.
-        Учитывает SIZE_SCALE, DYNAMIC_SCALE, DYN_SCALE_FACTOR и Smart-Scaling по волатильности.
+        Расчёт объёма позиции исходя из допустимого риска.
         """
-        if master_size == 0:
+        if balance <= 0 or price <= 0:
+            logger.error("❌ Неверные входные данные для расчёта позиции.")
             return 0.0
 
-        size_scale = self.cfg.get("SIZE_SCALE", 1.0)
-        dyn_scale = self.cfg.get("DYN_SCALE_FACTOR", 0.9)
-        qty = master_size * size_scale
+        risk_amount = balance * self.max_risk_per_trade
+        allowed_margin = risk_amount * leverage
+        position_size = allowed_margin / price
 
-        # ===== Smart-Scaling по волатильности =====
-        if self.cfg.get("VOLATILITY_SCALE", True):
-            vol = self.api.get_volatility(symbol)
-            if vol > 25:
-                qty *= 0.5
-                logging.info(f"⚠️ {symbol}: высокая волатильность {vol:.1f}% → размер ×0.5")
-            elif vol > 15:
-                qty *= 0.7
-                logging.info(f"⚠️ {symbol}: средняя волатильность {vol:.1f}% → размер ×0.7")
+        logger.debug(
+            f"💰 Расчёт размера позиции: баланс={balance:.2f}, риск={risk_amount:.2f}, "
+            f"цена={price:.2f}, плечо={leverage}, объём={position_size:.6f}"
+        )
+        return round(position_size, 6)
 
-        # ===== Динамический масштаб по equity =====
-        if self.cfg.get("DYNAMIC_SCALE", True):
-            master_eq = self.api.get_master_equity()
-            follower_eq = self.api.get_follower_equity()
-            if master_eq > 0:
-                ratio = (follower_eq / master_eq) * dyn_scale
-                qty *= min(size_scale, ratio)
-                logging.info(f"🔹 Динамическое масштабирование: {ratio:.2f}")
+    # ================================================================
+    # 🔹 Проверка на возможную ликвидацию
+    # ================================================================
 
-        # ===== Ограничение по equity-риск % =====
-        follower_eq = self.api.get_follower_equity()
-        max_risk = self.cfg.get("MAX_EQUITY_RISK_PCT", 2.0)
-        if follower_eq > 0:
-            max_notional = follower_eq * (max_risk / 100)
-            qty_value = master_price * qty
-            if qty_value > max_notional:
-                qty = max_notional / master_price
-                logging.info(f"⚠️ {symbol}: ограничено по риску {max_risk}% → {qty}")
-
-        return round(qty, 3)
-
-    # ====================== ЛОКАЛЬНЫЙ STOP LOSS ======================
-    async def check_local_stoploss(self, symbol):
-        """Закрывает позицию, если цена ушла против больше LOCAL_SL_PCT%"""
-        local_sl = self.cfg.get("LOCAL_SL_PCT", 25)
-        if local_sl <= 0:
-            return
-
-        pos = self.api.get_position(symbol)
-        if not pos or float(pos["size"]) == 0:
-            return
-
-        entry = float(pos.get("avgPrice") or 0)
-        mark = self.api.get_mark_price(symbol)
-        if entry == 0 or mark == 0:
-            return
-
-        change = (mark - entry) / entry * (1 if pos["side"] == "Buy" else -1) * 100
-        if change <= -local_sl:
-            logging.warning(f"🟥 {symbol}: цена ушла против на {abs(change):.2f}% > {local_sl}% → закрытие позиции")
-            self.api.close_position(symbol)
-            return True
-        return False
-
-    # ====================== АВТО-ПАУЗА ======================
-    async def check_autopause(self):
+    def check_liquidation_risk(self, side: str, entry_price: float, balance: float, leverage: float = 10) -> bool:
         """
-        Проверка просадки equity → если > EQUITY_DRAWDOWN_PCT → COPY_ACTIVE=False
+        Оценивает риск ликвидации при неблагоприятном движении.
         """
-        now = time.time()
-        if now - self.last_check < 10:
-            return
-        self.last_check = now
+        if not all([entry_price, balance]):
+            logger.warning("⚠️ Недостаточно данных для оценки риска ликвидации.")
+            return False
 
-        follower_eq = self.api.get_follower_equity()
-        self.max_equity = max(self.max_equity, follower_eq)
-        drawdown_pct = 0
-        if self.max_equity > 0:
-            drawdown_pct = (1 - follower_eq / self.max_equity) * 100
+        liquidation_distance = (1 / leverage) * 100
+        logger.debug(
+            f"📉 Риск ликвидации для {side.upper()}: плечо={leverage} → "
+            f"допустимое движение ±{liquidation_distance:.2f}%"
+        )
 
-        limit = self.cfg.get("EQUITY_DRAWDOWN_PCT", 15)
-        if drawdown_pct >= limit and self.cfg.get("COPY_ACTIVE", True):
-            logging.warning(f"🛑 Просадка {drawdown_pct:.1f}% ≥ {limit}% → пауза копирования")
-            self.cfg["COPY_ACTIVE"] = False
-            save_config(self.cfg)
+        if leverage > self.max_leverage:
+            logger.warning(f"🚫 Превышено макс. плечо: {leverage}x (лимит {self.max_leverage}x)")
+            return False
 
-            # Закрытие всех позиций, если включено AUTO_CLOSE_ON_DRAWDOWN
-            if self.cfg.get("AUTO_CLOSE_ON_DRAWDOWN", False):
-                positions = self.api.get_positions()
-                for pos in positions:
-                    if float(pos["size"]) != 0:
-                        self.api.close_position(pos["symbol"])
+        return True
 
-            # Отправить уведомление
-            self.api.send_telegram_message("⚠️ Копирование приостановлено из-за просадки депозита")
+    # ================================================================
+    # 🔹 Применение параметров риска к сделке
+    # ================================================================
 
-    # ====================== ПРОЧИЕ ПРОВЕРКИ ======================
-    def check_liq_buffer(self, symbol):
-        """Проверка минимального буфера до ликвидации"""
-        buf_min = self.cfg.get("MIN_LIQ_BUFFER_PCT", 20)
-        pos = self.api.get_position(symbol)
-        if not pos or float(pos["size"]) == 0:
-            return
-        mark = self.api.get_mark_price(symbol)
-        liq = float(pos.get("liqPrice") or 0)
-        if mark and liq:
-            buffer = abs(mark - liq) / mark * 100
-            if buffer < buf_min:
-                logging.warning(f"⚠️ {symbol}: буфер ликвидации {buffer:.2f}% < {buf_min}%")
+    def apply_risk_rules(self, symbol: str, side: str, price: float, balance: float, leverage: float = 10) -> dict:
+        """
+        Основная точка входа: применяет риск-правила перед открытием сделки.
+        Возвращает dict с рекомендациями.
+        """
+        if not self.check_balance(balance):
+            return {"allowed": False, "reason": "Недостаточно средств"}
+
+        if not self.check_liquidation_risk(side, price, balance, leverage):
+            return {"allowed": False, "reason": "Риск ликвидации слишком высок"}
+
+        qty = self.calculate_position_size(balance, price, leverage)
+        allowed = qty > 0
+
+        result = {
+            "allowed": allowed,
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "leverage": leverage,
+            "price": price,
+            "test_mode": self.test_mode,
+        }
+
+        logger.info(
+            f"✅ Риск-проверка для {symbol}: "
+            f"{'разрешено' if allowed else 'запрещено'}, объём={qty}, плечо={leverage}x"
+        )
+        return result
+
+    # ================================================================
+    # 🔹 Обновление конфигурации (без записи в .env)
+    # ================================================================
+
+    def update_settings(self, **kwargs):
+        """
+        Обновляет параметры риска (в памяти, без сохранения в .env).
+        """
+        for key, value in kwargs.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+                logger.info(f"⚙️ Обновлено значение параметра {key} = {value}")
+        logger.info("✅ Конфигурация риска обновлена (без сохранения в .env)")

@@ -1,138 +1,171 @@
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from trader.stats import StatsManager
-from config import save_config
-from telegram.messages import get_param_description
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
 
-# ============================================================
-#  Telegram UI — меню, кнопки, категории
-# ============================================================
+from telegram.messages import (
+    get_welcome_text,
+    get_settings_text,
+    get_positions_text,
+    get_stats_loading_text,
+    build_stats_text,
+    main_menu_kb,
+    settings_inline_kb,
+    settings_net_kb,
+    settings_risk_kb,
+    settings_alerts_kb,
+)
+
+logger = logging.getLogger(__name__)
 
 class TelegramUI:
-    def __init__(self, cfg, trader):
+    def __init__(self, cfg: dict, trader):
         self.cfg = cfg
         self.trader = trader
-        self.stats = trader.stats
-        self.bot = Bot(token=cfg["TELEGRAM_BOT_TOKEN"])
-        self.dp = Dispatcher(self.bot)
 
-        self._register_handlers()
+        self.bot = Bot(token=self.cfg["TELEGRAM_BOT_TOKEN"], parse_mode="HTML")
+        self.dp = Dispatcher(storage=MemoryStorage())
 
-    # ====================== ЗАПУСК ======================
-    async def run(self):
-        logging.info("🤖 Telegram-бот запущен")
-        await self.dp.start_polling()
+        # Команды
+        self.dp.message.register(self.cmd_start, Command("start"))
+        self.dp.message.register(self.cmd_stats, Command("stats"))
+        self.dp.message.register(self.on_text)
 
-    # ====================== ОБРАБОТЧИКИ ======================
-    def _register_handlers(self):
-        self.dp.register_message_handler(self.cmd_start, commands=["start"])
-        self.dp.register_callback_query_handler(self.on_callback)
+        # Callback-и из инлайн-кнопок
+        self.dp.callback_query.register(self.cb_settings_router, F.data.startswith("settings:"))
 
-    async def cmd_start(self, message: types.Message):
-        text = "⚙️ Главное меню бота копитрейдинга"
-        await message.answer(text, reply_markup=self.main_menu())
+    # ---------------- Команды / Сообщения ----------------
 
-    # ====================== КЛАВИАТУРЫ ======================
-    def main_menu(self):
-        kb = InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            InlineKeyboardButton("📈 Основные", callback_data="cat_main"),
-            InlineKeyboardButton("📊 Масштабирование", callback_data="cat_scale"),
-            InlineKeyboardButton("🧮 Риск", callback_data="cat_risk"),
-            InlineKeyboardButton("⏸ Пауза и уведомления", callback_data="cat_pause"),
-            InlineKeyboardButton("📈 Статистика", callback_data="stats_menu"),
-        )
-        return kb
+    async def cmd_start(self, msg: Message):
+        await msg.answer(get_welcome_text(), reply_markup=main_menu_kb())
 
-    def back_menu(self):
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-        return kb
+    async def cmd_stats(self, msg: Message):
+        # 1) отправляем "загрузка" с reply keyboard (новое сообщение)
+        loading = await msg.answer(get_stats_loading_text(), reply_markup=main_menu_kb())
 
-    def stats_menu(self):
-        kb = InlineKeyboardMarkup(row_width=3)
-        kb.add(
-            InlineKeyboardButton("🕐 1д", callback_data="stat_1"),
-            InlineKeyboardButton("🗓 7д", callback_data="stat_7"),
-            InlineKeyboardButton("📅 30д", callback_data="stat_30"),
-            InlineKeyboardButton("🧭 90д", callback_data="stat_90"),
-            InlineKeyboardButton("📊 Вся история", callback_data="stat_all"),
-            InlineKeyboardButton("🔄 Обновить", callback_data="stat_refresh"),
-            InlineKeyboardButton("⬅️ Назад", callback_data="back_main")
-        )
-        return kb
+        try:
+            # 2) параллельно берём балансы
+            master_balance_task = asyncio.create_task(self.trader.master_api.get_balance())
+            follower_balance_task = asyncio.create_task(self.trader.follower_api.get_balance())
+            summary = self.trader.stats.get_summary()
+            master_balance, follower_balance = await asyncio.gather(master_balance_task, follower_balance_task)
 
-    # ====================== КАТЕГОРИИ ======================
-    def category_menu(self, category):
-        """Создаёт меню параметров для категории"""
-        cat_map = {
-            "cat_main": [
-                "COPY_ACTIVE", "COPY_TP", "COPY_SL", "DRY_RUN", "POSITION_IDX"
-            ],
-            "cat_scale": [
-                "SIZE_SCALE", "DYNAMIC_SCALE", "DYN_SCALE_FACTOR",
-                "VOLATILITY_SCALE"
-            ],
-            "cat_risk": [
-                "MAX_EQUITY_RISK_PCT", "MIN_LIQ_BUFFER_PCT",
-                "MAX_DCA_PER_TRADE", "LOCAL_SL_PCT",
-                "LIQ_BUFFER_EMERGENCY", "CUT_PERCENT"
-            ],
-            "cat_pause": [
-                "EQUITY_DRAWDOWN_PCT", "AUTO_CLOSE_ON_DRAWDOWN",
-                "RISK_ALERTS"
-            ]
-        }
-
-        kb = InlineKeyboardMarkup(row_width=1)
-        for p in cat_map.get(category, []):
-            val = self.cfg.get(p)
-            text = f"{p}: {val}"
-            kb.add(InlineKeyboardButton(text, callback_data=f"param_{p}"))
-        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-        return kb
-
-    # ====================== ОБРАБОТКА CALLBACK ======================
-    async def on_callback(self, query: types.CallbackQuery):
-        data = query.data
-        if data == "back_main":
-            await query.message.edit_text("⚙️ Главное меню", reply_markup=self.main_menu())
-
-        elif data.startswith("cat_"):
-            await query.message.edit_text(
-                "Выберите параметр:",
-                reply_markup=self.category_menu(data)
+            text = build_stats_text(
+                master_env=self.trader.master_env,
+                follower_env=self.trader.follower_env,
+                master_balance=master_balance,
+                follower_balance=follower_balance,
+                summary=summary,
+                currency="USDT",
             )
 
-        elif data.startswith("param_"):
-            param = data.replace("param_", "")
-            desc = get_param_description(param)
-            value = self.cfg.get(param)
-            msg = f"🔧 <b>{param}</b>\n\n{desc}\n\nТекущее значение: <b>{value}</b>"
-            await query.message.edit_text(msg, reply_markup=self.param_menu(param))
+            # 3) пытаемся заменить текст лоадера
+            try:
+                await loading.edit_text(text)
+            except TelegramBadRequest:
+                # если редактировать нельзя — удаляем лоадер и шлём новое сообщение
+                try:
+                    await loading.delete()
+                except Exception:
+                    pass
+                await msg.answer(text, reply_markup=main_menu_kb())
 
-        elif data.startswith("stat_"):
-            days = {
-                "stat_1": 1,
-                "stat_7": 7,
-                "stat_30": 30,
-                "stat_90": 90,
-                "stat_all": 0,
-                "stat_refresh": -1
-            }[data]
-            if days == -1:
-                await query.message.edit_text("🔄 Обновление статистики...", reply_markup=self.stats_menu())
-            else:
-                report = self.stats.get_report(days)
-                await query.message.edit_text(report, reply_markup=self.stats_menu())
+        except Exception as e:
+            logger.warning(f"[TelegramUI] Ошибка формирования статистики: {e}")
+            # тоже: если нельзя редактировать — удаляем и шлём новое
+            try:
+                await loading.edit_text("⚠️ Не удалось получить статистику. Попробуйте позже.")
+            except TelegramBadRequest:
+                try:
+                    await loading.delete()
+                except Exception:
+                    pass
+                await msg.answer("⚠️ Не удалось получить статистику. Попробуйте позже.", reply_markup=main_menu_kb())
 
-        await query.answer()
+    async def on_text(self, msg: Message):
+        text = (msg.text or "").strip()
 
-    def param_menu(self, param):
-        """Меню для отдельного параметра (изменение значения)"""
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("✏️ Изменить", callback_data=f"edit_{param}"))
-        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-        return kb
+        if text == "⚙️ Настройки":
+            await msg.answer(get_settings_text(), reply_markup=settings_inline_kb())
+            return
+
+        if text == "📊 Статистика":
+            await self.cmd_stats(msg)
+            return
+
+        if text == "📂 Открытые позиции":
+            await msg.answer(get_positions_text(), reply_markup=main_menu_kb())
+            return
+
+        if text == "🔄 Перезапуск":
+            await msg.answer("♻️ Перезапуск бота (заглушка).", reply_markup=main_menu_kb())
+            # здесь можно повесить безопасный рестарт через systemd или внутренний сигнал
+            return
+
+        # по умолчанию просто вернуть главное меню
+        await msg.answer("Выберите действие на клавиатуре ниже.", reply_markup=main_menu_kb())
+
+    # ---------------- Callback-и настроек ----------------
+
+    async def cb_settings_router(self, cq: CallbackQuery):
+        data = cq.data
+
+        if data == "settings:back":
+            await cq.message.edit_text(get_settings_text(), reply_markup=settings_inline_kb())
+            await cq.answer()
+            return
+
+        if data == "settings:set_net":
+            await cq.message.edit_text("🌐 Выберите торговую сеть:", reply_markup=settings_net_kb())
+            await cq.answer()
+            return
+
+        if data == "settings:set_risk":
+            await cq.message.edit_text("🛡️ Параметры риска и режимов:", reply_markup=settings_risk_kb())
+            await cq.answer()
+            return
+
+        if data == "settings:set_alerts":
+            await cq.message.edit_text("🔔 Управление уведомлениями:", reply_markup=settings_alerts_kb())
+            await cq.answer()
+            return
+
+        # Подсеть выбора
+        if data.startswith("settings:net:"):
+            net = data.split(":")[-1]
+            await cq.answer(f"Сеть выбрана: {net}")
+            # здесь можно сохранить выбор в конфиг или state.json и предложить перезапуск
+            await cq.message.edit_text(get_settings_text(), reply_markup=settings_inline_kb())
+            return
+
+        if data == "settings:risk:max_risk":
+            await cq.answer("Пришлите новое значение MAX_RISK_PCT (например, 3.5).")
+            await cq.message.answer("✍️ Введите число, % риска на сделку. (пока заглушка)")
+            return
+
+        if data == "settings:risk:test_mode":
+            await cq.answer("Переключение TEST_MODE (пока заглушка).")
+            await cq.message.edit_text("TEST_MODE переключён (заглушка).", reply_markup=settings_inline_kb())
+            return
+
+        if data == "settings:alerts:toggle":
+            await cq.answer("Оповещения переключены (заглушка).")
+            await cq.message.edit_text("🔔 Оповещения переключены (заглушка).", reply_markup=settings_inline_kb())
+            return
+
+        await cq.answer("Неизвестное действие.")
+
+    # ---------------- Запуск ----------------
+
+    async def run(self):
+        logger.info("🤖 Telegram-бот запущен и слушает команды.")
+        await self.dp.start_polling(self.bot)
+
+    async def close(self):
+        try:
+            await self.bot.session.close()
+        except Exception:
+            pass

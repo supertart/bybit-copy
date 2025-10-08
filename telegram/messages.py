@@ -1,46 +1,113 @@
-# ============================================================
-#  ОПИСАНИЯ ПАРАМЕТРОВ (на русском языке)
-# ============================================================
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from datetime import datetime
 
-def get_param_description(param: str) -> str:
-    """Возвращает текстовое описание параметра для Telegram"""
+# ---------- Текстовые шаблоны ----------
 
-    descriptions = {
+def get_welcome_text() -> str:
+    return (
+        "👋 Привет! Я бот копитрейдинга.\n\n"
+        "Используй кнопки ниже, чтобы управлять ботом:\n"
+        "• 🔄 Перезапуск\n"
+        "• ⚙️ Настройки\n"
+        "• 📂 Открытые позиции\n"
+        "• 📊 Статистика\n"
+    )
 
-        # ---------- Основные ----------
-        "COPY_ACTIVE": "Вкл/выкл копирование сделок мастера. "
-                       "Если выключено — бот наблюдает, но не открывает новые сделки.",
-        "COPY_TP": "Копировать ли уровни Take-Profit с мастера.",
-        "COPY_SL": "Копировать ли уровни Stop-Loss с мастера (если они есть).",
-        "DRY_RUN": "Тестовый режим. Сделки не отправляются на биржу, только отображаются в логах.",
-        "POSITION_IDX": "Режим позиции: 0 — One-Way, 1 — Hedge Long, 2 — Hedge Short.",
+def get_settings_text() -> str:
+    return (
+        "⚙️ Настройки бота:\n\n"
+        "• Изменить торговую сеть (mainnet/testnet/demo)\n"
+        "• Настроить параметры риска и лотности\n"
+        "• Управлять Telegram-уведомлениями\n\n"
+        "Используйте кнопки ниже для выбора."
+    )
 
-        # ---------- Масштабирование ----------
-        "SIZE_SCALE": "Базовый коэффициент размера позиции. "
-                      "Например, 0.5 означает, что подписчик торгует половину объёма мастера.",
-        "DYNAMIC_SCALE": "Динамическое масштабирование объёма по отношению к капиталу мастера и подписчика.",
-        "DYN_SCALE_FACTOR": "Коэффициент запаса при динамическом масштабировании (обычно 0.8–1.0).",
-        "VOLATILITY_SCALE": "Smart-Scaling — автоматическое уменьшение объёма при высокой волатильности рынка.",
+def get_positions_text() -> str:
+    return "📂 Открытые позиции будут показаны здесь (пока заглушка)."
 
-        # ---------- Риск ----------
-        "MAX_EQUITY_RISK_PCT": "Максимальный риск на одну позицию в процентах от депозита подписчика.",
-        "MIN_LIQ_BUFFER_PCT": "Минимальный запас до ликвидации (%). "
-                              "Если меньше — бот не добавляет объём в позицию.",
-        "MAX_DCA_PER_TRADE": "Максимальное количество усреднений (DCA) в одной сделке.",
-        "LOCAL_SL_PCT": "Локальный стоп-лосс — закрытие сделки, если цена ушла против на заданный процент.",
-        "LIQ_BUFFER_EMERGENCY": "Порог аварийного буфера (%). "
-                                "Если меньше — бот автоматически сокращает позицию.",
-        "CUT_PERCENT": "Доля позиции, сокращаемая при аварийном буфере ликвидации.",
+def _fmt_dt(dt_iso: str | None) -> str:
+    if not dt_iso:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return dt_iso
 
-        # ---------- Пауза и уведомления ----------
-        "EQUITY_DRAWDOWN_PCT": "Порог просадки от максимума депозита. "
-                               "Если превышен — копирование приостанавливается.",
-        "AUTO_CLOSE_ON_DRAWDOWN": "Закрывать ли все позиции автоматически при срабатывании автопаузы.",
-        "RISK_ALERTS": "Включает уведомления о рисковых событиях: "
-                       "просадка, буфер ликвидации, высокая волатильность, достижение цели прибыли.",
+def build_stats_text(
+    master_env: str,
+    follower_env: str,
+    master_balance: float,
+    follower_balance: float,
+    summary: dict,
+    currency: str = "USDT",
+) -> str:
+    """
+    Формирует красивый блок статистики, включая балансы мастера/подписчика.
+    """
+    open_cnt = summary.get("open_count", 0)
+    closed_cnt = summary.get("closed_count", 0)
+    updated_at = _fmt_dt(summary.get("updated_at"))
 
-        # ---------- Прочее ----------
-        "NOTIFY_LANG": "Язык уведомлений Telegram (в данной версии — всегда русский).",
-    }
+    return (
+        "📊 <b>Статистика бота</b>\n\n"
+        f"👤 <b>Мастер</b> [{master_env}] — баланс: <code>{master_balance:,.2f} {currency}</code>\n"
+        f"🤖 <b>Подписчик</b> [{follower_env}] — баланс: <code>{follower_balance:,.2f} {currency}</code>\n"
+        "\n"
+        f"📌 Открытых сделок: <b>{open_cnt}</b>\n"
+        f"📦 Закрытых сделок: <b>{closed_cnt}</b>\n"
+        f"🕒 Обновлено: <i>{updated_at}</i>\n"
+    )
 
-    return descriptions.get(param, "Описание параметра пока не добавлено.")
+def get_stats_loading_text() -> str:
+    return "⏳ Собираю статистику и балансы…"
+
+# ---------- Главная клавиатура (ReplyKeyboard) ----------
+
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="🔄 Перезапуск"),
+                KeyboardButton(text="⚙️ Настройки"),
+            ],
+            [
+                KeyboardButton(text="📂 Открытые позиции"),
+                KeyboardButton(text="📊 Статистика"),
+            ],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Выберите действие…",
+    )
+
+# ---------- Клавиатура настроек (InlineKeyboard) ----------
+
+def settings_inline_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Торговая сеть", callback_data="settings:set_net")],
+        [InlineKeyboardButton(text="🛡️ Риск и лотность", callback_data="settings:set_risk")],
+        [InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings:set_alerts")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:back")],
+    ])
+
+def settings_net_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="demo (бумажная)", callback_data="settings:net:demo")],
+        [InlineKeyboardButton(text="testnet", callback_data="settings:net:testnet")],
+        [InlineKeyboardButton(text="mainnet", callback_data="settings:net:mainnet")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:back")],
+    ])
+
+def settings_risk_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Изменить MAX_RISK_PCT", callback_data="settings:risk:max_risk")],
+        [InlineKeyboardButton(text="Изменить TEST_MODE", callback_data="settings:risk:test_mode")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:back")],
+    ])
+
+def settings_alerts_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Вкл/Выкл оповещения", callback_data="settings:alerts:toggle")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:back")],
+    ])

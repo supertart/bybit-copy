@@ -1,120 +1,119 @@
+"""
+Модуль ядра бота CopyTrader
+---------------------------
+Отвечает за синхронизацию сделок мастера и подписчика.
+"""
+
 import asyncio
 import logging
-import time
-from trader.master_bridge import MasterBridge
-from utils.api_wrappers import BybitHTTP
 from trader.risk import RiskManager
 from trader.stats import StatsManager
+from utils.api_wrappers import BybitAPI
 
+logger = logging.getLogger(__name__)
 
 class CopyTrader:
-    """
-    Основной класс копирования сделок мастера.
-    Поддерживает разные сети и режимы мастера.
-    """
-
-    def __init__(self, cfg):
+    def __init__(self, cfg: dict):
         self.cfg = cfg
+        self.master_mode = cfg.get("MASTER_MODE", "trade")
+        self.master_env = cfg.get("MASTER_ENV", "mainnet")
+        self.follower_env = cfg.get("FOLLOWER_ENV", "mainnet")
 
-        # ---- Мастер ----
-        self.master = MasterBridge(cfg)
+        logger.info(f"🧩 Инициализация мастера ({self.master_mode}, env={self.master_env})")
 
-        # ---- Подписчик ----
-        follower_net = cfg.get("FOLLOWER_NET", "mainnet").lower()
-        follower_testnet = follower_net == "testnet"
-        self.follower_api = BybitHTTP(
-            cfg["FOLLOWER_API_KEY"],
-            cfg["FOLLOWER_API_SECRET"],
-            testnet=follower_testnet
+        self.master_api = BybitAPI(
+            api_key=cfg.get("MASTER_API_KEY"),
+            api_secret=cfg.get("MASTER_API_SECRET"),
+            role="MASTER",
+            env=self.master_env,
+        )
+        self.follower_api = BybitAPI(
+            api_key=cfg.get("FOLLOWER_API_KEY"),
+            api_secret=cfg.get("FOLLOWER_API_SECRET"),
+            role="FOLLOWER",
+            env=self.follower_env,
         )
 
-        # ---- Сервисы ----
         self.stats = StatsManager(cfg)
         self.risk = RiskManager(cfg, self.follower_api)
-        self.last_check = 0
+        logger.info(f"📡 Подписчик env={self.follower_env}")
 
-        logging.info(f"📡 Подписчик сеть={follower_net}")
+        self.ignored_symbols = set()
 
-    async def run_forever(self):
-        logging.info("🟢 Запуск цикла копирования сделок")
-        while True:
-            try:
-                await self.sync_positions()
-                await asyncio.sleep(5)
-            except Exception as e:
-                logging.warning(f"Ошибка цикла копирования: {e}")
-                await asyncio.sleep(5)
+    async def fetch_master_positions(self):
+        try:
+            return await self.master_api.get_open_positions() or []
+        except Exception as e:
+            logger.warning(f"[MASTER] fetch_master_positions failed: {e}")
+            return []
 
-    async def sync_positions(self):
-        """Синхронизация позиций мастера и подписчика"""
-        now = time.time()
-        if now - self.last_check < 5:
-            return
-        self.last_check = now
+    async def fetch_follower_positions(self):
+        try:
+            return await self.follower_api.get_open_positions() or []
+        except Exception as e:
+            logger.warning(f"[FOLLOWER] fetch_follower_positions failed: {e}")
+            return []
 
-        master_positions = self.master.get_positions()
-        follower_positions = self.follower_api.get_positions()
+    async def run_copy_loop(self):
+        logger.info("🟢 Запуск цикла копирования сделок")
 
-        for mpos in master_positions:
-            symbol = mpos["symbol"]
-            side = mpos["side"]
-            size = float(mpos.get("size") or 0)
-            entry_price = float(mpos.get("avgPrice") or 0)
-            tp = float(mpos.get("takeProfit") or 0)
-            sl = float(mpos.get("stopLoss") or 0)
-
-            fpos = next((p for p in follower_positions if p["symbol"] == symbol), None)
-            fsize = float(fpos["size"]) if fpos else 0.0
-
-            # ---- Закрытие ----
-            if size == 0 and fsize != 0:
-                await self.close_position(symbol, fpos)
-                continue
-
-            # ---- Расчёт нужного размера ----
-            qty = self.risk.calculate_scaled_qty(
-                master_size=size,
-                master_price=entry_price,
-                symbol=symbol
+        master_positions = await self.fetch_master_positions()
+        self.ignored_symbols = {pos["symbol"] for pos in master_positions}
+        if self.ignored_symbols:
+            logger.info(
+                f"🔸 Найдено {len(self.ignored_symbols)} активных позиций мастера. "
+                f"Они будут проигнорированы при старте: {', '.join(self.ignored_symbols)}"
             )
+        else:
+            logger.info("✅ У мастера нет активных позиций при старте — копирование начнётся немедленно.")
 
-            if fsize == 0 and qty > 0:
-                await self.open_position(symbol, side, qty)
-            elif abs(qty - fsize) / max(qty, 1) > 0.05:
-                await self.adjust_position(symbol, side, qty, fsize)
+        try:
+            while True:
+                master_positions = await self.fetch_master_positions()
+                follower_positions = await self.fetch_follower_positions()
 
-            # ---- TP/SL ----
-            if tp > 0 and self.cfg.get("COPY_TP", True):
-                self.follower_api.set_take_profit(symbol, tp)
-            if sl > 0 and self.cfg.get("COPY_SL", True):
-                self.follower_api.set_stop_loss(symbol, sl)
+                master_symbols = {p["symbol"] for p in master_positions}
+                follower_symbols = {p["symbol"] for p in follower_positions}
 
-            await self.risk.check_local_stoploss(symbol)
-            await self.risk.check_autopause()
+                for pos in master_positions:
+                    symbol = pos["symbol"].upper()
+                    side = pos["side"]
+                    qty = float(pos.get("contracts") or pos.get("size") or 0)
+                    price = float(pos.get("entryPrice") or 0)
+                    leverage = int(pos.get("leverage") or 10)
 
-        self.stats.update_from_positions(follower_positions)
+                    if symbol in self.ignored_symbols:
+                        continue
 
-    async def open_position(self, symbol, side, qty):
-        if not self.cfg.get("COPY_ACTIVE", True):
-            return
-        logging.info(f"📈 Открытие позиции {symbol} {side} {qty}")
-        self.follower_api.market_order(symbol, side, qty)
-        self.stats.on_open(symbol, qty)
+                    if symbol not in follower_symbols and qty > 0:
+                        logger.info(f"🆕 Новая позиция мастера: {symbol} ({side}, qty={qty})")
+                        balance = await self.follower_api.get_balance()
+                        risk_check = self.risk.apply_risk_rules(symbol, side, price, balance, leverage)
+                        if not risk_check["allowed"]:
+                            logger.warning(f"🚫 Сделка {symbol} отклонена: {risk_check['reason']}")
+                            continue
 
-    async def close_position(self, symbol, pos):
-        side = "Sell" if pos["side"] == "Buy" else "Buy"
-        qty = abs(float(pos["size"]))
-        logging.info(f"📉 Закрытие позиции {symbol} {side} {qty}")
-        self.follower_api.market_order(symbol, side, qty, reduce_only=True)
-        self.stats.on_close(symbol, qty)
+                        await self.follower_api.open_position(symbol, side, qty, leverage)
+                        self.stats.record_open_trade(symbol, side, qty, price, leverage)
+                        logger.info(f"✅ Сделка {symbol} открыта у подписчика.")
+                        self.ignored_symbols.add(symbol)
 
-    async def adjust_position(self, symbol, side, target_qty, current_qty):
-        if not self.cfg.get("COPY_ACTIVE", True):
-            return
-        delta = target_qty - current_qty
-        if abs(delta) < 1e-6:
-            return
-        adj_side = side if delta > 0 else ("Sell" if side == "Buy" else "Buy")
-        adj_qty = abs(delta)
-        logging.info(f"⚙️ Корректировка {symbol}: {adj_side} {adj_qty}")
-        self.follower_api.market_order(symbol, adj_side, adj_qty, reduce_only=(delta < 0))
+                for sym in list(self.ignored_symbols):
+                    if sym not in master_symbols:
+                        logger.info(f"🔻 Мастер закрыл {sym}. Закрываем и у подписчика.")
+                        await self.follower_api.close_position(sym)
+                        self.stats.record_close_trade(sym, price=0.0, pnl=0.0)
+                        self.ignored_symbols.remove(sym)
+
+                self.stats.update_from_positions(follower_positions)
+                await asyncio.sleep(self.cfg.get("POLL_INTERVAL_SEC", 5))
+
+        except asyncio.CancelledError:
+            logger.warning("🟥 Цикл копирования остановлен (SIGINT/SIGTERM).")
+            raise
+        except Exception as e:
+            logger.warning(f"Ошибка цикла копирования: {e}")
+            await asyncio.sleep(5)
+
+    async def start(self):
+        await self.run_copy_loop()

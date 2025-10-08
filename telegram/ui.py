@@ -10,8 +10,8 @@ from telegram.messages import (
     get_welcome_text,
     get_settings_text,
     get_positions_text,
-    get_stats_loading_text,
-    build_stats_text,
+    get_stats_loading_text,   # можно оставить как есть или вернуть фиксированный текст
+    build_stats_text_extended,
     main_menu_kb,
     settings_inline_kb,
     settings_net_kb,
@@ -20,6 +20,8 @@ from telegram.messages import (
 )
 
 logger = logging.getLogger(__name__)
+
+PNL_WINDOWS = [1, 7, 14, 30, 45, 60, 90]
 
 class TelegramUI:
     def __init__(self, cfg: dict, trader):
@@ -43,30 +45,44 @@ class TelegramUI:
         await msg.answer(get_welcome_text(), reply_markup=main_menu_kb())
 
     async def cmd_stats(self, msg: Message):
-        # 1) отправляем "загрузка" с reply keyboard (новое сообщение)
+        # лоадер
         loading = await msg.answer(get_stats_loading_text(), reply_markup=main_menu_kb())
 
         try:
-            # 2) параллельно берём балансы
+            # параллельно собираем данные
             master_balance_task = asyncio.create_task(self.trader.master_api.get_balance())
             follower_balance_task = asyncio.create_task(self.trader.follower_api.get_balance())
-            summary = self.trader.stats.get_summary()
-            master_balance, follower_balance = await asyncio.gather(master_balance_task, follower_balance_task)
+            follower_positions_task = asyncio.create_task(self.trader.follower_api.get_open_positions_detailed())
 
-            text = build_stats_text(
+            summary = self.trader.stats.get_summary()
+            pnl_map = self.trader.stats.pnl_by_windows(PNL_WINDOWS)
+
+            master_balance, follower_balance, follower_positions = await asyncio.gather(
+                master_balance_task, follower_balance_task, follower_positions_task
+            )
+
+            # агрегируем позиции подписчика
+            follower_open_count = len(follower_positions)
+            follower_positions_value_total = float(sum(p.get("positionValue", 0.0) for p in follower_positions))
+            follower_unrealized_total = float(sum(p.get("unrealisedPnl", 0.0) for p in follower_positions))
+
+            text = build_stats_text_extended(
                 master_env=self.trader.master_env,
                 follower_env=self.trader.follower_env,
                 master_balance=master_balance,
                 follower_balance=follower_balance,
-                summary=summary,
+                follower_open_count=follower_open_count,
+                follower_positions_value_total=follower_positions_value_total,
+                follower_unrealized_total=follower_unrealized_total,
+                summary_updated_at=summary.get("updated_at"),
+                pnl_windows=pnl_map,
                 currency="USDT",
             )
 
-            # 3) пытаемся заменить текст лоадера
+            # редактируем, если можно; иначе удаляем и шлём новое
             try:
                 await loading.edit_text(text)
             except TelegramBadRequest:
-                # если редактировать нельзя — удаляем лоадер и шлём новое сообщение
                 try:
                     await loading.delete()
                 except Exception:
@@ -75,7 +91,6 @@ class TelegramUI:
 
         except Exception as e:
             logger.warning(f"[TelegramUI] Ошибка формирования статистики: {e}")
-            # тоже: если нельзя редактировать — удаляем и шлём новое
             try:
                 await loading.edit_text("⚠️ Не удалось получить статистику. Попробуйте позже.")
             except TelegramBadRequest:
@@ -102,10 +117,8 @@ class TelegramUI:
 
         if text == "🔄 Перезапуск":
             await msg.answer("♻️ Перезапуск бота (заглушка).", reply_markup=main_menu_kb())
-            # здесь можно повесить безопасный рестарт через systemd или внутренний сигнал
             return
 
-        # по умолчанию просто вернуть главное меню
         await msg.answer("Выберите действие на клавиатуре ниже.", reply_markup=main_menu_kb())
 
     # ---------------- Callback-и настроек ----------------
@@ -133,11 +146,9 @@ class TelegramUI:
             await cq.answer()
             return
 
-        # Подсеть выбора
         if data.startswith("settings:net:"):
             net = data.split(":")[-1]
             await cq.answer(f"Сеть выбрана: {net}")
-            # здесь можно сохранить выбор в конфиг или state.json и предложить перезапуск
             await cq.message.edit_text(get_settings_text(), reply_markup=settings_inline_kb())
             return
 

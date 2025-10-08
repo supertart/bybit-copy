@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List
 
 logger = logging.getLogger(__name__)
@@ -10,8 +10,8 @@ class StatsManager:
     def __init__(self, cfg: dict):
         self.state_file = cfg.get("STATE_FILE", "state.json")
         self.state: Dict[str, Any] = {
-            "history": [],          # список завершённых сделок
-            "open": {},             # symbol -> инфо по открытой
+            "history": [],          # список завершённых сделок: [{symbol, pnl, opened_at, closed_at, ...}]
+            "open": {},             # symbol -> инфо открытой: {symbol, side, qty, entry_price, opened_at, leverage, averages}
             "updated_at": None,
         }
         self._load()
@@ -23,7 +23,6 @@ class StatsManager:
                 with open(self.state_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
-                    # гарантия полей
                     data.setdefault("history", [])
                     data.setdefault("open", {})
                     data.setdefault("updated_at", None)
@@ -40,6 +39,8 @@ class StatsManager:
         except Exception as e:
             logger.warning(f"Не удалось сохранить {self.state_file}: {e}")
 
+    # ----- записи о сделках -----
+
     def record_open_trade(self, symbol: str, side: str, qty: float, price: float, leverage: int):
         self.state["open"][symbol] = {
             "symbol": symbol,
@@ -55,13 +56,11 @@ class StatsManager:
     def record_close_trade(self, symbol: str, price: float, pnl: float):
         info = self.state["open"].pop(symbol, None)
         if not info:
-            # ничего не было — просто игнор
             return
         info["exit_price"] = price
         info["pnl"] = pnl
         info["closed_at"] = datetime.utcnow().isoformat()
 
-        # длительность (в секундах)
         try:
             opened = datetime.fromisoformat(info["opened_at"])
             closed = datetime.fromisoformat(info["closed_at"])
@@ -73,8 +72,10 @@ class StatsManager:
         self._save()
 
     def update_from_positions(self, follower_positions: List[Dict[str, Any]]):
-        # можно расширить обновлением плавающего PnL и т.д.
+        # можно расширить обновлением плавающего PnL и т.п.
         self._save()
+
+    # ----- агрегаты -----
 
     def get_summary(self) -> Dict[str, Any]:
         return {
@@ -82,3 +83,27 @@ class StatsManager:
             "closed_count": len(self.state.get("history", [])),
             "updated_at": self.state.get("updated_at"),
         }
+
+    def pnl_last_days(self, days: int) -> float:
+        """Сумма PnL по закрытым сделкам за последние N дней (UTC)."""
+        if days <= 0:
+            return 0.0
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        total = 0.0
+        for t in self.state.get("history", []):
+            try:
+                closed = datetime.fromisoformat(str(t.get("closed_at")))
+            except Exception:
+                continue
+            if closed >= cutoff:
+                try:
+                    total += float(t.get("pnl", 0.0))
+                except Exception:
+                    pass
+        return float(total)
+
+    def pnl_by_windows(self, windows: List[int]) -> Dict[int, float]:
+        res: Dict[int, float] = {}
+        for d in windows:
+            res[d] = self.pnl_last_days(d)
+        return res

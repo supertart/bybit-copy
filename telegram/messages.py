@@ -1,8 +1,6 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from datetime import datetime
 
-# ---------- Текстовые шаблоны ----------
-
 def get_welcome_text() -> str:
     return (
         "👋 Привет! Я бот копитрейдинга.\n\n"
@@ -34,35 +32,44 @@ def _fmt_dt(dt_iso: str | None) -> str:
     except Exception:
         return dt_iso
 
-def build_stats_text(
+def _fmt_money(x: float) -> str:
+    try:
+        return f"{x:,.2f}"
+    except Exception:
+        return str(x)
+
+def build_stats_text_extended(
     master_env: str,
     follower_env: str,
     master_balance: float,
     follower_balance: float,
-    summary: dict,
+    follower_open_count: int,
+    follower_positions_value_total: float,
+    follower_unrealized_total: float,
+    summary_updated_at: str | None,
+    pnl_windows: dict[int, float],
     currency: str = "USDT",
 ) -> str:
-    """
-    Формирует красивый блок статистики, включая балансы мастера/подписчика.
-    """
-    open_cnt = summary.get("open_count", 0)
-    closed_cnt = summary.get("closed_count", 0)
-    updated_at = _fmt_dt(summary.get("updated_at"))
+    lines = []
+    lines.append("📊 <b>Статистика бота</b>")
+    lines.append("")
+    lines.append(f"👤 <b>Мастер</b> [{master_env}] — баланс: <code>{_fmt_money(master_balance)} {currency}</code>")
+    lines.append(f"🤖 <b>Подписчик</b> [{follower_env}] — баланс: <code>{_fmt_money(follower_balance)} {currency}</code>")
+    lines.append("")
+    lines.append(f"📌 Открытых позиций: <b>{follower_open_count}</b>")
+    lines.append(f"💰 Стоимость открытых позиций: <code>{_fmt_money(follower_positions_value_total)} {currency}</code>")
+    lines.append(f"📈 Нереализ. PnL (UPnL): <code>{_fmt_money(follower_unrealized_total)} {currency}</code>")
+    lines.append("")
+    if pnl_windows:
+        lines.append("🧾 <b>PNL подписчика</b>:")
+        for days in [1, 7, 14, 30, 45, 60, 90]:
+            val = pnl_windows.get(days, 0.0)
+            lines.append(f" • {days:>2} дн: <code>{_fmt_money(val)} {currency}</code>")
+        lines.append("")
+    lines.append(f"🕒 Обновлено: <i>{_fmt_dt(summary_updated_at)}</i>")
+    return "\n".join(lines)
 
-    return (
-        "📊 <b>Статистика бота</b>\n\n"
-        f"👤 <b>Мастер</b> [{master_env}] — баланс: <code>{master_balance:,.2f} {currency}</code>\n"
-        f"🤖 <b>Подписчик</b> [{follower_env}] — баланс: <code>{follower_balance:,.2f} {currency}</code>\n"
-        "\n"
-        f"📌 Открытых сделок: <b>{open_cnt}</b>\n"
-        f"📦 Закрытых сделок: <b>{closed_cnt}</b>\n"
-        f"🕒 Обновлено: <i>{updated_at}</i>\n"
-    )
-
-def get_stats_loading_text() -> str:
-    return "⏳ Собираю статистику и балансы…"
-
-# ---------- Главная клавиатура (ReplyKeyboard) ----------
+# ---------- Главная клавиатура ----------
 
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -81,7 +88,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         input_field_placeholder="Выберите действие…",
     )
 
-# ---------- Клавиатура настроек (InlineKeyboard) ----------
+# ---------- Настройки ----------
 
 def settings_inline_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[

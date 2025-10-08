@@ -1,26 +1,16 @@
 """
 Bybit Unified v5 (demo/testnet/mainnet) — асинхронная обёртка на aiohttp
 ------------------------------------------------------------------------
-Базовые домены:
+Домены:
 - demo:    https://api-demo.bybit.com
 - testnet: https://api-testnet.bybit.com
 - mainnet: https://api.bybit.com
 
-Единый торговый аккаунт (UNIFIED), линейные перпетуалы (USDT).
-Методы:
-    - check_auth()
-    - get_balance()
-    - get_open_positions()
-    - set_leverage(symbol, leverage)
-    - open_position(symbol, side, qty, leverage)
-    - close_position(symbol)
-    - close()
-
+Работаем с UNIFIED + линейные перпетуалы (USDT).
 Подпись v5: HMAC_SHA256(secret, ts + apiKey + recvWindow + queryString + body)
 timestamp берём с /v5/market/time (timeNano -> ms).
 
-ВАЖНО: для POST кладём category="linear" в BODY (не в query),
-чтобы строка подписи совпадала с тем, что ожидает Bybit (как в твоём логе origin_string).
+POST: category="linear" кладём в BODY (не в query), чтобы строка подписи совпадала с Bybit.
 """
 
 import aiohttp
@@ -59,7 +49,7 @@ class BybitAPI:
         self.base = _base_url(self.env)
 
         self._session: Optional[aiohttp.ClientSession] = None
-        self._recv_window = "20000"  # окно на всякий случай
+        self._recv_window = "20000"
 
         logger.info(f"🔗 [{self.role}] Bybit v5 Unified init: env={self.env} base={self.base}")
 
@@ -75,7 +65,6 @@ class BybitAPI:
         url = f"{self.base}/v5/market/time"
         async with self._session.get(url) as r:
             j = await r.json()
-        # timeNano -> миллисекунды
         ts_ms = int(math.floor(int(j["result"]["timeNano"]) / 1e6))
         return str(ts_ms)
 
@@ -94,14 +83,8 @@ class BybitAPI:
         params = params or {}
         body = body or {}
 
-        # query string (сортируем для детерминированности подписи)
-        if params:
-            qs_pairs = [f"{k}={v}" for k, v in sorted(params.items())]
-            query = "&".join(qs_pairs)
-        else:
-            query = ""
-
-        # тело подписываем как JSON без пробелов
+        # query string (детерминированный порядок)
+        query = "&".join([f"{k}={v}" for k, v in sorted(params.items())]) if params else ""
         body_str = json.dumps(body, separators=(",", ":")) if body else ""
 
         ts = await self._get_server_ts_ms()
@@ -172,11 +155,7 @@ class BybitAPI:
         return 0.0
 
     async def get_open_positions(self) -> List[Dict[str, Any]]:
-        """
-        Unified позиции по линейным перпетуалам USDT.
-        Требует либо symbol, либо settleCoin — добавляем settleCoin=USDT.
-        Возвращаем: symbol, side ('buy'/'sell'), contracts, entryPrice, leverage
-        """
+        """Короткая форма (для логики копирования)."""
         data = await self._request(
             "GET",
             "/v5/position/list",
@@ -193,42 +172,69 @@ class BybitAPI:
                 size = 0.0
             if size <= 0:
                 continue
-            side = (item.get("side") or "").lower()  # "buy" / "sell"
-            symbol = (item.get("symbol") or "").upper()  # "BTCUSDT"
-            entry = float(item.get("avgPrice") or 0.0)
-            lev = int(float(item.get("leverage") or 10))
             result.append({
-                "symbol": symbol,
-                "side": side,
+                "symbol": (item.get("symbol") or "").upper(),
+                "side": (item.get("side") or "").lower(),
                 "contracts": size,
-                "entryPrice": entry,
-                "leverage": lev,
+                "entryPrice": float(item.get("avgPrice") or 0.0),
+                "leverage": int(float(item.get("leverage") or 10)),
             })
         return result
 
+    async def get_open_positions_detailed(self) -> List[Dict[str, Any]]:
+        """
+        Детальная форма для статистики:
+        symbol, side, size, entryPrice, markPrice, positionValue, unrealisedPnl, leverage
+        """
+        data = await self._request(
+            "GET",
+            "/v5/position/list",
+            params={"category": "linear", "accountType": "UNIFIED", "settleCoin": "USDT"},
+        )
+        detailed: List[Dict[str, Any]] = []
+        if not data or str(data.get("retCode")) != "0":
+            return detailed
+
+        for it in (data.get("result", {}).get("list") or []):
+            try:
+                size = float(it.get("size") or 0.0)
+            except Exception:
+                size = 0.0
+            if size <= 0:
+                continue
+            entry = float(it.get("avgPrice") or 0.0)
+            mark = float(it.get("markPrice") or 0.0)
+            pos_val = float(it.get("positionValue") or 0.0)
+            upl = float(it.get("unrealisedPnl") or 0.0)
+            lev = int(float(it.get("leverage") or 10))
+            detailed.append({
+                "symbol": (it.get("symbol") or "").upper(),
+                "side": (it.get("side") or "").lower(),
+                "size": size,
+                "entryPrice": entry,
+                "markPrice": mark,
+                "positionValue": pos_val,     # USDT
+                "unrealisedPnl": upl,         # USDT
+                "leverage": lev,
+            })
+        return detailed
+
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
-        """
-        POST: category переносим в BODY, чтобы строка подписи совпадала.
-        """
         data = await self._request(
             "POST",
             "/v5/position/set-leverage",
-            params={},  # пусто!
+            params={},
             body={"category": "linear", "symbol": symbol.upper(), "buyLeverage": str(leverage), "sellLeverage": str(leverage)},
         )
         return bool(data and str(data.get("retCode")) == "0")
 
     async def open_position(self, symbol: str, side: str, qty: float, leverage: int = 10):
-        """
-        Рыночный вход. symbol: 'BTCUSDT', side: 'buy'|'sell', qty: число контрактов (size).
-        POST: category в BODY.
-        """
         side_v5 = "Buy" if side.lower() in ("buy", "long") else "Sell"
         await self.set_leverage(symbol, leverage)
         data = await self._request(
             "POST",
             "/v5/order/create",
-            params={},  # пусто!
+            params={},
             body={
                 "category": "linear",
                 "symbol": symbol.upper(),
@@ -245,10 +251,6 @@ class BybitAPI:
         return None
 
     async def close_position(self, symbol: str) -> bool:
-        """
-        Закрываем позицию встречным рыночным ордером.
-        POST: category в BODY.
-        """
         positions = await self.get_open_positions()
         pos = next((p for p in positions if p["symbol"] == symbol.upper()), None)
         if not pos:
@@ -264,7 +266,7 @@ class BybitAPI:
         data = await self._request(
             "POST",
             "/v5/order/create",
-            params={},  # пусто!
+            params={},
             body={
                 "category": "linear",
                 "symbol": symbol.upper(),
